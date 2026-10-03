@@ -288,6 +288,33 @@ class ReviewPackageSubmit(BaseModel):
     )
 
 
+class SearchRequest(BaseModel):
+    """版本范围字面子串检索请求（只读，分页大小固定 100）。
+
+    ``query`` 在 ``[from_version, to_version]`` 内逐版按 Unicode 码点做
+    字面匹配（保留重叠命中）；``to_version`` 缺省取首轮快照内的最新版。
+    ``context_radius`` 为前后文片段单侧最大码点数（0～80，缺省 16）。
+    ``cursor`` 为上一页返回的 next_cursor 或上一轮返回的 resume_cursor；
+    携带游标时其余筛选字段必须与游标冻结值完全一致（否则 422）。
+    """
+
+    query: str = Field(
+        min_length=1,
+        max_length=256,
+        description="要字面检索的文字（按 Unicode 码点匹配，保留重叠命中）",
+    )
+    from_version: int = Field(ge=1, description="版本范围下界（含）")
+    to_version: Optional[int] = Field(
+        None, ge=1, description="版本范围上界（含）；缺省取首轮快照最新版"
+    )
+    context_radius: int = Field(
+        default=16, ge=0, le=80, description="前后文片段单侧最大码点数（0～80）"
+    )
+    cursor: Optional[str] = Field(
+        None, description="next_cursor（续页）或 resume_cursor（续拉下一轮）"
+    )
+
+
 class ReleaseCandidateCreate(BaseModel):
     """创建文档审阅发布候选：提交文档版本与门禁策略修订。
 

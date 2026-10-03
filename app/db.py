@@ -9,10 +9,13 @@
 原样返回首次结果，不重复追加确认或完成。发布候选（release_candidates）
 同理：创建即冻结不可变快照，确认时仅在六类事件水位未变且门禁仍通过时
 补记一次 released 结果，同一 candidate_id 的重复确认原样返回首次结果。
+app_meta 保存服务级元数据（目前为版本范围检索游标的 HMAC 签名密钥，
+init_db 时随机生成一次，重启不变，不随游标外泄）。
 """
 from __future__ import annotations
 
 import os
+import secrets
 import sqlite3
 from contextlib import contextmanager
 
@@ -153,6 +156,14 @@ CREATE INDEX IF NOT EXISTS idx_completions_doc  ON completions (document_id);
 CREATE INDEX IF NOT EXISTS idx_policy_name      ON policy_revisions (name, revision);
 CREATE INDEX IF NOT EXISTS idx_review_packages_doc ON review_packages (document_id);
 CREATE INDEX IF NOT EXISTS idx_release_candidates_doc ON release_candidates (document_id);
+
+-- 服务级元数据（单行单键）：保存版本范围检索游标的 HMAC-SHA256 签名密钥。
+-- 密钥在 init_db 时随机生成一次，重启不变（游标跨重启仍可验签）；不随
+-- 游标外泄，篡改游标载荷会导致签名不符 → 422。
+CREATE TABLE IF NOT EXISTS app_meta (
+    key        TEXT PRIMARY KEY,
+    value      TEXT NOT NULL
+);
 """
 
 
@@ -240,5 +251,11 @@ def init_db() -> None:
     try:
         _assert_no_duplicate_confirmations(con)
         con.executescript(SCHEMA)
+        # 检索游标签名密钥：只追加式生成一次（INSERT OR IGNORE + 重读），
+        # 既有库与已运行环境升级时自动补齐，生成后永不更换。
+        con.execute(
+            "INSERT OR IGNORE INTO app_meta (key, value) VALUES (?, ?)",
+            ("search_cursor_secret", secrets.token_hex(32)),
+        )
     finally:
         con.close()

@@ -650,6 +650,89 @@ digest = hashlib.sha256(
 `package_digest_mismatch` 被 422 拒绝。无法识别的 `package_id` 返回
 404。
 
+### 版本范围字面子串检索
+
+`POST /documents/{id}/search` 让审阅人在**同一文档的指定版本范围**
+`[from_version, to_version]` 内检索一段文字，直接看到**命中位置与该处的
+批注状态**。请求体：
+
+| 字段 | 含义 |
+|---|---|
+| `query` | 要检索的文字，**1～256 个 Unicode 码点**；按字面子串匹配 |
+| `from_version` / `to_version` | 版本号闭区间；`to_version` 缺省取首轮快照内最新版 |
+| `context_radius` | 前后文片段单侧最大码点数，**0～80，缺省 16** |
+| `cursor` | 上一页的 `next_cursor`（续页）或上一轮的 `resume_cursor`（续拉） |
+
+**匹配规则**：逐版在全文上做按 **Unicode 码点**的字面匹配（Python 字符串
+下标口径，emoji 等 BMP 外字符算 1 个码点，不做任何归一化 / 大小写折叠），
+**保留重叠命中**——例如 `"aaaaa"` 查 `"aa"` 得到起点 `0,1,2,3` 四个命中。
+命中按 **`(版本号, 起点, 终点)` 稳定排序**，每一页**至多 100** 个。
+
+每个命中形如：
+
+```json
+{
+  "version_number": 2,
+  "start": 4, "end": 6,
+  "context": {
+    "before": "第二段：", "match": "心情", "after": "不错。第三段",
+    "snippet": "第二段：心情不错。第三段",
+    "snippet_start": 0, "snippet_end": 12,
+    "match_start_in_snippet": 4, "match_end_in_snippet": 6,
+    "truncated_left": false, "truncated_right": true
+  },
+  "annotations": [
+    {"annotation_id": 7, "status": "confirmed", "start": 4, "end": 8}
+  ]
+}
+```
+
+`context` 的各片段只依赖**不可变的版本全文**与随游标冻结的
+`context_radius`，相同快照 + 相同请求字节一致；
+`match_start_in_snippet` 可直接在 `snippet` 上复原高亮。
+
+**相交批注的生效状态**——列出该版本上与命中半开范围相交的批注（端点
+相接不算相交），按批注 ID 升序：
+
+| 状态 | 生效范围口径 |
+|---|---|
+| `confirmed` | 该版本迁移记录已被人工确认：**以确认范围为准**（确认范围优先于迁移记录自带范围与歧义候选） |
+| `resolved` | 自动续接成功：迁移记录自带范围 |
+| `ambiguous` | 未确认且非顺延：逐个检查全部候选，只返回**与命中相交的候选**（`candidates`），不挑选、不猜测 |
+| `unresolved` / 歧义顺延占位 | 该版本上没有范围，**不会出现在 `annotations` 中** |
+
+**快照冻结与分页**（与[文档增量事件流](#文档增量事件流)同一水位设计）：
+首轮在**同一个 SQLite 读事务**（同一快照）中固定
+`versions / annotations / locations / confirmations` 四张表属于本文档的
+最大行 ID（响应 `snapshot.watermark` 透明返回）与版本上界。
+
+- `next_cursor`（**续页**）：冻结版本上界、筛选条件、快照水位与最后
+  排序键 `(版本号, 起点, 终点)`；续页始终沿用该快照——**分页期间并发
+  新增的版本或批注 / 确认一律留到下一轮**，同轮各页的
+  `total_in_snapshot` 恒定，不重不漏；
+- `resume_cursor`（**续拉**）：一轮读尽（含没有命中的空轮）后返回；
+  携带它调用即在新的读事务中重新固定快照与版本上界，新增版本 /
+  批注 / 确认由此进入结果。首轮显式给出的 `to_version` 在续拉时保持
+  不变；缺省最新版的检索，续拉时重新取当时最新版。
+
+游标是 Base64URL 紧凑 JSON，载荷经服务启动时自动生成并存库的
+**HMAC-SHA256 密钥**签名（密钥不随游标外泄，重启不变）。下列情况一律
+**422**（`detail.error` 为机器码）：
+
+| 情况 | `error` |
+|---|---|
+| Base64 / JSON / 信封结构损坏、字段缺失或多余、水位类型不对 | `bad_cursor_structure` |
+| 游标版本号不支持 | `bad_cursor_version` |
+| 签名不符（载荷被篡改） | `cursor_tampered` |
+| 游标属于另一篇文档（不可跨文档使用） | `cross_document_cursor` |
+| 携带的 `query` / `from_version` / `to_version` / `context_radius` 与游标冻结值不一致（`fields` 指出字段名；可选字段省略时视为沿用） | `filter_mismatch` |
+| 冻结水位超过当前数据库（游标来自其他库）、游标内版本范围矛盾 | `bad_cursor_range` |
+| 请求版本号区间非法或超出快照最新版 | `invalid_version_range` / `version_out_of_range` |
+
+文档不存在返回 404；空 `query`、超长 `query`、越界 `context_radius`
+由 schema 直接 422。接口只读、不写入任何业务数据（仅启动时一次性
+初始化游标签名密钥）。
+
 ## API 一览
 
 | 方法 | 路径 | 说明 |
@@ -686,6 +769,7 @@ digest = hashlib.sha256(
 | GET | `/documents/{id}/events?limit=&cursor=` | 文档增量事件流：六类只追加记录按 (created_at, type_rank, id) 稳定合并，水位向量 + 续页/续拉游标分页（只读） |
 | POST | `/documents/{id}/review-packages` | 创建可离线往返的审阅包：同一读事务冻结最新迁移记录/候选/完成状态/全部传递前置，返回 package_id 与内容摘要 |
 | POST | `/review-packages/submit` | 回传审阅包：离线校验决定(422)→同写事务冲突检测(409,整包不写入)→按依赖顺序追加确认与完成；重复回传返回首次结果 |
+| POST | `/documents/{id}/search` | 版本范围字面子串检索：按 Unicode 码点字面匹配（保留重叠命中），逐命中返回半开范围、可复现前后文与相交批注的生效状态；每页至多 100 个，签名游标冻结版本上界与批注/位置快照（只读） |
 
 ## 完整示例
 
@@ -1548,6 +1632,119 @@ curl -X POST $B/release-candidates/$CID/confirm
 # 则返回 path="gate" 的 gate_not_passed 冲突并附当前解释树。
 ```
 
+### 版本范围检索：重叠命中、emoji 与并发写入
+
+```bash
+# 准备一篇含重叠词与 emoji 的文档，并在其上挂一条 resolved 批注、
+# 一条后续版本歧义（再人工确认）的批注
+curl -X POST $B/documents -H 'Content-Type: application/json' -d '{
+  "title": "发布说明",
+  "content": "哈哈😀哈哈，状态稳定，稳定。"
+}'
+# → {"document_id": 1}
+# 第 1 版码点序列：0 哈 1 哈 2 😀 3 哈 4 哈 5 ， 6 状 7 态 8 稳 9 定 10 ， 11 稳 12 定 13 。
+curl -X POST $B/documents/1/annotations -H 'Content-Type: application/json' -d '{
+  "body": "复核稳定性", "selection": "稳定",
+  "left_context": "状态", "right_context": "，",
+  "start": 8, "end": 10
+}'
+# → {"annotation_id": 1, "location": {"status": "resolved", "start": 8, "end": 10}}
+
+# 1. 【重叠命中】“哈哈”在第 1 版有两处重叠起点 [0,2) 与 [3,5)，
+#    emoji 占一个码点把它们隔开；命中按 (版本号, 起点, 终点) 排序
+curl -X POST $B/documents/1/search -H 'Content-Type: application/json' -d '{
+  "query": "哈哈", "from_version": 1
+}'
+# → {"hit_count": 2, "total_in_snapshot": 2, "has_more": false,
+#    "hits": [
+#      {"version_number": 1, "start": 0, "end": 2,
+#       "context": {"before": "", "match": "哈哈", "after": "😀哈哈，状态稳定，稳定。",
+#         "snippet": "哈哈😀哈哈，状态稳定，稳定。",
+#         "snippet_start": 0, "snippet_end": 14,
+#         "match_start_in_snippet": 0, "match_end_in_snippet": 2,
+#         "truncated_left": false, "truncated_right": false},
+#       "annotations": []},
+#      {"version_number": 1, "start": 3, "end": 5,
+#       "context": {"match": "哈哈", ...}, "annotations": []}]}
+
+# 2. 【emoji 按码点计】检索 emoji 本身：偏移不被多字节字符错位
+curl -X POST $B/documents/1/search -H 'Content-Type: application/json' -d '{
+  "query": "😀", "from_version": 1, "context_radius": 2
+}'
+# → {"hits": [{"version_number": 1, "start": 2, "end": 3,
+#    "context": {"before": "哈哈", "match": "😀", "after": "哈哈",
+#      "snippet": "哈哈😀哈哈", "match_start_in_snippet": 2, ...},
+#    "annotations": []}]}
+
+# 3. 【命中相交批注状态】“稳定”在第 1 版出现两次；批注 1 的生效范围
+#    [8,10) 与第一个命中相交（第二个命中 [11,13) 不相交），状态 resolved
+curl -X POST $B/documents/1/search -H 'Content-Type: application/json' -d '{
+  "query": "稳定", "from_version": 1
+}'
+# → {"hits": [
+#    {"version_number": 1, "start": 8, "end": 10,
+#     "annotations": [{"annotation_id": 1, "status": "resolved",
+#                      "start": 8, "end": 10}]},
+#    {"version_number": 1, "start": 11, "end": 13, "annotations": []}]}
+
+# 4. 【确认范围优先于迁移候选】第 2 版制造两处相同落点 → ambiguous，
+#    人工确认其一后，检索命中以确认范围标 confirmed（另一候选不再报告）
+curl -X POST $B/documents/1/versions -H 'Content-Type: application/json' -d '{
+  "content": "稳定，稳定。"
+}'
+# → results[0].status = "ambiguous"
+#   candidates = [{"start":0,"end":2,...}, {"start":3,"end":5,...}]
+curl -X POST $B/documents/1/annotations/1/confirmations \
+  -H 'Content-Type: application/json' -d '{"version_number": 2, "start": 3, "end": 5}'
+curl -X POST $B/documents/1/search -H 'Content-Type: application/json' -d '{
+  "query": "稳定", "from_version": 2, "to_version": 2
+}'
+# → {"hits": [
+#    {"version_number": 2, "start": 0, "end": 2, "annotations": []},
+#    {"version_number": 2, "start": 3, "end": 5,
+#     "annotations": [{"annotation_id": 1, "status": "confirmed",
+#                      "start": 3, "end": 5}]}]}
+
+# 5. 【并发写入留到下一轮】命中超过 100 时按 next_cursor 续页；
+#    续页严格沿用首轮冻结的版本上界与批注快照（示例用大量重叠命中）：
+curl -X POST $B/documents -H 'Content-Type: application/json' \
+  -d '{"title": "长文", "content": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}'
+#                                                                              （71 个 a → 70 个 “aa” 重叠命中）
+curl -X POST $B/documents/2/versions -H 'Content-Type: application/json' \
+  -d '{"content": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}'
+PAGE1=$(curl -s -X POST $B/documents/2/search -H 'Content-Type: application/json' \
+  -d '{"query": "aa", "from_version": 1}')
+echo "$PAGE1" | python3 -c 'import sys,json;j=json.load(sys.stdin);print(j["hit_count"], j["total_in_snapshot"], j["snapshot"]["latest_version"])'
+# → 100 140 2
+CUR=$(echo "$PAGE1" | python3 -c 'import sys,json;print(json.load(sys.stdin)["next_cursor"])')
+
+# 分页期间另一个客户端并发提交了第 3 版（又是 70 个命中）
+curl -s -X POST $B/documents/2/versions -H 'Content-Type: application/json' \
+  -d '{"content": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}' >/dev/null
+
+# 续页仍返回冻结快照的剩余 40 条，不含第 3 版，水位与首轮一致
+curl -s -X POST $B/documents/2/search -H 'Content-Type: application/json' \
+  -d "{\"query\": \"aa\", \"from_version\": 1, \"cursor\": \"$CUR\"}" \
+  | python3 -c 'import sys,json;j=json.load(sys.stdin);print(j["hit_count"], j["total_in_snapshot"], j["snapshot"]["latest_version"], bool(j["resume_cursor"]))'
+# → 40 140 2 True
+RESUME=$(curl -s -X POST $B/documents/2/search -H 'Content-Type: application/json' \
+  -d "{\"query\": \"aa\", \"from_version\": 1, \"cursor\": \"$CUR\"}" \
+  | python3 -c 'import sys,json;print(json.load(sys.stdin)["resume_cursor"])')
+
+# 用 resume_cursor 续拉开新快照：第 3 版进入结果（共 210 条），
+# 再沿 next_cursor 取尽新快照即可；没有新数据的空轮也返回新的 resume_cursor
+curl -s -X POST $B/documents/2/search -H 'Content-Type: application/json' \
+  -d "{\"query\": \"aa\", \"from_version\": 1, \"cursor\": \"$RESUME\"}" \
+  | python3 -c 'import sys,json;j=json.load(sys.stdin);print(j["total_in_snapshot"], j["snapshot"]["latest_version"], j["has_more"])'
+# → 210 3 True
+
+# 6. 【游标安全】篡改载荷、跨文档使用或改动筛选条件 → 422
+curl -s -X POST $B/documents/2/search -H 'Content-Type: application/json' \
+  -d "{\"query\": \"a\", \"from_version\": 1, \"cursor\": \"$CUR\"}"
+# → 422 {"detail": {"error": "filter_mismatch",
+#    "message": "请求的筛选条件与游标冻结值不一致：query……", "fields": ["query"]}}
+```
+
 ## 项目结构
 
 ```
@@ -1564,6 +1761,7 @@ app/
   archive.py    # 迁移归档：同一读事务导出、规范化 JSON + SHA-256、离线一致性核验（不查库）
   review_packages.py # 离线审阅包：同读事务冻结快照/自动收录传递前置、离线决定整批校验、回传冲突检测与同写事务按依赖顺序应用、首次结果幂等重放
   release_candidates.py # 发布候选：同读事务固定版本/策略修订/门禁解释树/审阅状态/六类事件水位，初始门禁不过不落候选；确认时同写事务重读水位与门禁，冲突可定位且不改候选，水位未变且门禁通过才追加一次 released、重复确认幂等重放
+  search.py     # 版本范围字面子串检索：码点字面匹配（保留重叠）、前后文片段、相交批注生效状态（确认范围优先）、四表快照水位与 HMAC 签名续页/续拉游标（纯函数 + 游标编解码）
   db.py         # SQLite 连接、建表、读写事务
   schemas.py    # 请求体模型（含门禁策略、归档结构、核验请求、批量偏移换算与审阅包模型）
 tests/
@@ -1580,6 +1778,7 @@ tests/
   test_archive.py   # 归档导出与离线核验测试（摘要篡改/缺行/串文档/顺延/确认非法）
   test_review_packages.py # 离线审阅包测试（同事务冻结/自动收录前置/离线整批校验/四类冲突不写入/依赖顺序应用/回滚/幂等重放/并发）
   test_release_candidates.py # 发布候选测试（同读事务冻结/初始门禁不过不落候选/六类水位与门禁复评冲突可定位/冲突不改候选/released 只写一次/幂等重放/跨文档隔离）
+  test_search.py # 版本范围检索测试（重叠命中/emoji 码点偏移/四类相交状态/确认优先/100 分页稳定/并发版本与确认留到下一轮/续拉开新快照/游标篡改跨文档筛选不一致 422）
 Dockerfile
 docker-compose.yml
 requirements.txt        # 运行依赖

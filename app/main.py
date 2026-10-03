@@ -64,6 +64,13 @@
   该文档出现任一六类事件、或门禁不再通过，即返回可定位冲突且不改变
   候选状态；仅水位未变且门禁仍通过时追加一次 released 结果，重复确认
   同一 candidate_id 原样返回首次结果、不重复写入。
+- 版本范围字面子串检索：审阅人在同一文档的版本号区间内按 Unicode 码点
+  做字面子串匹配（保留重叠命中），每个命中返回版本号、半开范围、可复现
+  的前后文片段以及与该范围相交的批注 ID 与生效状态（resolved / confirmed /
+  ambiguous；确认范围优先于迁移候选，ambiguous 返回相交候选）；每页至多
+  100 个命中并按版本号、起点、终点稳定排序；游标在同一个 SQLite 读事务中
+  冻结版本上界与批注 / 位置 / 确认快照水位，分页期间并发新增留到下一轮，
+  篡改、跨文档或筛选条件不一致的游标返回 422。
 """
 from __future__ import annotations
 
@@ -82,6 +89,7 @@ from . import events as events_mod
 from . import gate as gate_mod
 from . import release_candidates as rc_mod
 from . import review_packages as rp_mod
+from . import search as search_mod
 from .diffing import (
     classify_range,
     compute_segments,
@@ -117,6 +125,7 @@ from .schemas import (
     ReleaseCandidateCreate,
     ReviewPackageCreate,
     ReviewPackageSubmit,
+    SearchRequest,
     VersionCreate,
 )
 
@@ -129,7 +138,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="文档修订批注续接 API",
-    version="1.10.0",
+    version="1.11.0",
     description=(
         "基于选区 + 左右上下文锚点的批注跨版本续接，"
         "以及批注间的审阅依赖编排（依赖图校验、审阅计划、完成记录）。"
@@ -156,7 +165,12 @@ app = FastAPI(
         "审阅状态与六类事件水位并生成不可变 candidate_id 与摘要，"
         "确认时同写事务重读水位与门禁，有任一六类事件或门禁不再通过即"
         "可定位冲突且不改变候选，水位未变且门禁通过才追加一次 released，"
-        "重复确认原样返回首次结果。"
+        "重复确认原样返回首次结果；"
+        "以及版本范围字面子串检索：按 Unicode 码点字面匹配并保留重叠命中，"
+        "逐命中返回半开范围、可复现前后文与相交批注的生效状态，"
+        "每页至多 100 个、按版本号/起点/终点稳定排序，"
+        "签名游标冻结版本上界与批注/位置快照，并发新增留到下一轮，"
+        "篡改、跨文档或筛选不一致的游标返回 422。"
     ),
     lifespan=lifespan,
 )
@@ -298,7 +312,7 @@ def _annotation_out(con: sqlite3.Connection, ann: sqlite3.Row) -> dict:
 def root():
     return {
         "service": "文档修订批注续接 API",
-        "version": "1.10.0",
+        "version": "1.11.0",
         "docs": "/docs",
         "offsets": "所有偏移均按 Unicode 码点计",
         "archive_format": archive_mod.ARCHIVE_FORMAT,
@@ -2290,6 +2304,209 @@ def document_events(
         "has_more": has_more,
         "events": events,
         "window": {"from": window_from, "to": window_to},
+        "next_cursor": next_cursor,
+        "resume_cursor": resume_cursor,
+    }
+
+
+# ---------------------------------------------------------------------------
+# 版本范围字面子串检索：命中位置与相交批注状态
+# ---------------------------------------------------------------------------
+
+
+def _search_cursor_error(exc: search_mod.CursorError) -> HTTPException:
+    return HTTPException(
+        422, detail={"error": exc.error, "message": exc.message}
+    )
+
+
+@app.post("/documents/{document_id}/search")
+def search_document(
+    document_id: int, payload: SearchRequest, con=Depends(get_db)
+):
+    """在同一文档的指定版本范围内字面子串检索（只读）。
+
+    在版本号区间 ``[from_version, to_version]`` 内逐版按 **Unicode 码点**
+    做字面匹配（保留重叠命中）；每个命中返回版本号、半开范围
+    ``[start, end)``、可复现的前后文片段，以及在该版本上**与该范围相交**
+    的批注 ID 与生效状态：
+
+    - 有人工确认 → ``confirmed``，以确认范围为准（确认范围优先于迁移
+      候选）；``resolved`` → 迁移记录自带范围；
+    - 未确认且非顺延的 ``ambiguous`` → 列出与命中相交的**候选范围**；
+    - ``unresolved`` 与歧义顺延占位在该版本没有范围，不会出现在
+      ``annotations`` 中。
+
+    命中按 ``(版本号, 起点, 终点)`` 稳定排序，每页**至多 100** 个。首轮在
+    **同一个 SQLite 读事务**中固定 versions / annotations / locations /
+    confirmations 四表单文档水位快照与版本上界；``next_cursor``（续页）
+    始终沿用该快照——分页期间并发新增的版本或批注 / 确认**留到下一轮**；
+    窗口读尽后返回 ``resume_cursor``，携带它调用即在新快照中开启下一轮
+    （空轮也会签发新的 resume_cursor）。游标经 HMAC-SHA256 签名：
+    篡改、跨文档使用或携带的筛选条件与签发时不一致一律 **422**。
+    """
+    with db.read_transaction(con):
+        _get_document(con, document_id)
+        secret = search_mod.get_secret(con)
+        ceiling = search_mod.current_watermark(con, document_id)
+
+        if payload.cursor is None:
+            query = payload.query
+            from_version = payload.from_version
+            explicit_to = payload.to_version
+            radius = payload.context_radius
+            wm = ceiling
+            after: Optional[tuple] = None
+        else:
+            try:
+                parsed = search_mod.decode_cursor(payload.cursor, secret)
+            except search_mod.CursorError as exc:
+                raise _search_cursor_error(exc)
+            if parsed["doc"] != document_id:
+                raise HTTPException(
+                    422,
+                    detail={
+                        "error": "cross_document_cursor",
+                        "message": f"游标属于文档 {parsed['doc']}，不能用于文档 "
+                        f"{document_id} 的检索（游标不可跨文档使用）",
+                    },
+                )
+            # 筛选条件一致性：query / from_version 必须逐字一致；可选字段
+            # （to_version / context_radius）在请求中**省略**时视为沿用游标
+            # 值（方便客户端只回传 cursor），显式给出但与冻结值不同才拒绝。
+            mismatches = [
+                name
+                for name, same in (
+                    ("query", payload.query == parsed["q"]),
+                    ("from_version", payload.from_version == parsed["vf"]),
+                    (
+                        "to_version",
+                        payload.to_version is None
+                        or payload.to_version == parsed["vt"],
+                    ),
+                    (
+                        "context_radius",
+                        "context_radius" not in payload.model_fields_set
+                        or payload.context_radius == parsed["r"],
+                    ),
+                )
+                if not same
+            ]
+            if mismatches:
+                raise HTTPException(
+                    422,
+                    detail={
+                        "error": "filter_mismatch",
+                        "message": "请求的筛选条件与游标冻结值不一致："
+                        + "、".join(mismatches)
+                        + "（续用游标时必须原样携带签发时的 "
+                        "query / from_version / to_version / context_radius；"
+                        "新的筛选条件请重新发起首轮检索）",
+                        "fields": mismatches,
+                    },
+                )
+
+            query = parsed["q"]
+            from_version = parsed["vf"]
+            radius = parsed["r"]
+            try:
+                # 续页 / 续拉都不接受水位超过当前库（游标来自其他库等）
+                search_mod.ensure_within(parsed["wm"], ceiling)
+            except search_mod.CursorError as exc:
+                raise _search_cursor_error(exc)
+            if parsed["kind"] == "page":
+                # 续页：快照、版本上界与最后排序键全部沿用游标
+                wm = parsed["wm"]
+                after = parsed["after"]
+                explicit_to = None if parsed["td"] else parsed["vt"]
+            else:
+                # 续拉：在本快照开启下一轮，新增版本 / 批注 / 确认由此进入。
+                # vt=None（首轮缺省最新版）时下一轮仍缺省取新快照最新版；
+                # vt=具体版本号时显式上界保持不变。
+                wm = ceiling
+                after = None
+                explicit_to = parsed["vt"]
+
+        latest = con.execute(
+            "SELECT number FROM versions WHERE document_id = ? AND id <= ? "
+            "ORDER BY number DESC LIMIT 1",
+            (document_id, wm["versions"]),
+        ).fetchone()
+        if latest is None:
+            raise HTTPException(404, f"文档 {document_id} 在当前快照中没有任何版本")
+        latest_number = latest["number"]
+        if from_version > latest_number:
+            raise HTTPException(
+                422,
+                detail={
+                    "error": "version_out_of_range",
+                    "message": f"from_version={from_version} 超出当前快照的最新"
+                    f"版本号 {latest_number}",
+                },
+            )
+        to_version = explicit_to if explicit_to is not None else latest_number
+        if to_version < from_version:
+            raise HTTPException(
+                422,
+                detail={
+                    "error": "invalid_version_range",
+                    "message": f"版本范围非法：from_version={from_version} 大于 "
+                    f"to_version={to_version}",
+                },
+            )
+        if to_version > latest_number:
+            raise HTTPException(
+                422,
+                detail={
+                    "error": "version_out_of_range",
+                    "message": f"to_version={to_version} 超出当前快照的最新"
+                    f"版本号 {latest_number}（续页期间新增的版本已留到下一轮，"
+                    "请用 resume_cursor 续拉）",
+                },
+            )
+
+        versions = search_mod.load_versions(
+            con, document_id, wm, from_version, to_version
+        )
+        effective_by_version = {
+            version["id"]: search_mod.load_effective(con, version["id"], wm)
+            for version in versions
+        }
+        hits, keys = search_mod.build_hits(
+            versions, query, radius, effective_by_version
+        )
+        page, last_key, has_more = search_mod.select_page(hits, keys, after)
+
+    if has_more:
+        # 续页游标记录本轮实际检索上界；td 标注它是否由缺省最新版解析而来，
+        # 以便该轮读尽派生 resume 游标时恢复「缺省最新版」语义。
+        next_cursor = search_mod.make_page_cursor(
+            document_id, query, from_version, to_version, radius, wm,
+            last_key, secret, to_default=explicit_to is None,
+        )
+        resume_cursor = None
+    else:
+        next_cursor = None
+        # 记录调用方显式给出的上界（缺省最新版时为 None，续拉重新取最新）
+        resume_cursor = search_mod.make_resume_cursor(
+            document_id, query, from_version, explicit_to, radius, wm, secret
+        )
+
+    return {
+        "document_id": document_id,
+        "query": query,
+        "from_version": from_version,
+        "to_version": to_version,
+        "context_radius": radius,
+        "page_size": search_mod.PAGE_SIZE,
+        "hit_count": len(page),
+        "total_in_snapshot": len(hits),
+        "has_more": has_more,
+        "hits": page,
+        "snapshot": {
+            "latest_version": latest_number,
+            "watermark": wm,
+        },
         "next_cursor": next_cursor,
         "resume_cursor": resume_cursor,
     }
