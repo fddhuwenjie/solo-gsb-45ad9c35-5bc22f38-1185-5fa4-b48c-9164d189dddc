@@ -43,6 +43,13 @@
   合并重叠候选再计入 possible（同一 ID 不重复），unresolved、顺延占位与
   该版尚不存在的批注列入 exclusions；片段状态 covered / uncertain /
   uncovered 无缝铺满全文，接口只读、相同快照字节一致。
+- 版本范围内字面检索：指定同一文档的版本范围与一段文字，按 Unicode 码点
+  做字面子串匹配并保留重叠命中；每个命中返回版本号、半开范围、可复现的
+  前后文片段，以及与该范围相交的批注 ID 和生效状态（resolved /
+  confirmed / ambiguous / unresolved，确认范围优先于迁移候选）；
+  结果按 (版本号, 起点, 终点) 稳定排序，每页至多 100 个命中；续页游标
+  冻结版本上界与批注 / 位置快照（分页期间新增版本或批注留到下一轮），
+  篡改、跨文档或筛选条件不一致的游标返回 422，接口只读。
 - 批量偏移换算：为浏览器与外部工具把 codepoint / utf16 / utf8_byte
   三种单位的半开区间批量互转（每请求至多 200 个）；先按目标版本全文
   一次构建边界映射，整批 O(n + m)；越界、start > end、端点落入 UTF-16
@@ -82,6 +89,7 @@ from . import events as events_mod
 from . import gate as gate_mod
 from . import release_candidates as rc_mod
 from . import review_packages as rp_mod
+from . import search as search_mod
 from .diffing import (
     classify_range,
     compute_segments,
@@ -129,7 +137,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="文档修订批注续接 API",
-    version="1.10.0",
+    version="1.11.0",
     description=(
         "基于选区 + 左右上下文锚点的批注跨版本续接，"
         "以及批注间的审阅依赖编排（依赖图校验、审阅计划、完成记录）。"
@@ -156,7 +164,12 @@ app = FastAPI(
         "审阅状态与六类事件水位并生成不可变 candidate_id 与摘要，"
         "确认时同写事务重读水位与门禁，有任一六类事件或门禁不再通过即"
         "可定位冲突且不改变候选，水位未变且门禁通过才追加一次 released，"
-        "重复确认原样返回首次结果。"
+        "重复确认原样返回首次结果；"
+        "以及版本范围内字面检索：按 Unicode 码点字面子串匹配并保留重叠命中，"
+        "每个命中返回版本号、半开范围、可复现前后文片段与相交批注的生效状态"
+        "（确认范围优先于迁移候选），按 (版本号, 起点, 终点) 稳定排序分页，"
+        "续页游标冻结版本上界与批注 / 位置快照（并发新增留到下一轮），"
+        "篡改、跨文档或筛选条件不一致的游标返回 422。"
     ),
     lifespan=lifespan,
 )
@@ -298,7 +311,7 @@ def _annotation_out(con: sqlite3.Connection, ann: sqlite3.Row) -> dict:
 def root():
     return {
         "service": "文档修订批注续接 API",
-        "version": "1.10.0",
+        "version": "1.11.0",
         "docs": "/docs",
         "offsets": "所有偏移均按 Unicode 码点计",
         "archive_format": archive_mod.ARCHIVE_FORMAT,
@@ -2292,4 +2305,160 @@ def document_events(
         "window": {"from": window_from, "to": window_to},
         "next_cursor": next_cursor,
         "resume_cursor": resume_cursor,
+    }
+
+
+# ---------------------------------------------------------------------------
+# 版本范围内字面检索：命中分页、可复现上下文与相交批注状态
+# ---------------------------------------------------------------------------
+
+
+def _search_cursor_error(exc: search_mod.CursorError) -> HTTPException:
+    return HTTPException(
+        422, detail={"error": exc.error, "message": exc.message}
+    )
+
+
+@app.get("/documents/{document_id}/search")
+def search_text(
+    document_id: int,
+    query: str = Query(
+        min_length=1,
+        description="要检索的文字（按 Unicode 码点字面子串匹配，保留重叠命中）",
+    ),
+    from_version: int = Query(1, ge=1, description="起始版本号（含）"),
+    to_version: Optional[int] = Query(
+        None, ge=1, description="结束版本号（含）；缺省冻结为当前最新版"
+    ),
+    context: int = Query(
+        search_mod.DEFAULT_CONTEXT,
+        ge=0,
+        le=search_mod.MAX_CONTEXT,
+        description="前后文片段长度（码点数，0～200）",
+    ),
+    limit: int = Query(
+        50, ge=1, le=search_mod.MAX_LIMIT, description="每页命中数（1～100）"
+    ),
+    cursor: Optional[str] = Query(
+        None, description="上一页返回的 next_cursor"
+    ),
+    con=Depends(get_db),
+):
+    """在指定版本范围内检索一段文字，返回命中位置与相交批注状态（只读）。
+
+    对 ``[from_version, to_version]`` 内每版全文按 **Unicode 码点**做字面
+    子串匹配（**保留重叠命中**：``aaaa`` 中检索 ``aa`` 得 3 个命中）。
+    每个命中返回：
+
+    - ``version_number`` 与半开范围 ``[start, end)``（码点偏移）；
+    - **可复现的前后文片段**：``context.before`` / ``context.after`` 为命中
+      两侧至多 ``context`` 个码点的原文，配合 ``before_start`` /
+      ``after_end`` 满足 ``content[before_start:start] == before``、
+      ``content[end:after_end] == after``，可按版本全文独立复算核对；
+    - ``annotations``：与该范围**相交**（半开区间有公共码点）的批注，按
+      批注 ID 升序，每条给出**生效状态**与实际相交的生效范围——人工确认
+      过的位置以**确认范围**为准（``confirmed``，确认范围优先于迁移候选），
+      ``resolved`` 取迁移落点，未确认且非顺延的 ``ambiguous`` 取相交的候选
+      范围；``unresolved`` 与歧义顺延占位在该版没有生效范围，不与命中相交。
+
+    **分页与快照**：结果按 ``(version_number, start, end)`` 全序稳定排序，
+    每页至多 100 个命中（``limit`` 1～100，默认 50）。首轮在**同一个
+    SQLite 读事务**（同一快照）中冻结**版本上界**（``to_version`` 缺省取
+    当前最新版）与**批注 / 位置快照**（annotations / locations /
+    confirmations 三张只追加表上属于本文档的最大行 ID，响应 ``snapshot``
+    透明给出）；``next_cursor`` 续页游标封装文档 ID、筛选条件、快照水位与
+    最后排序键，分页期间**并发新增的版本 / 批注 / 迁移 / 确认留到下一轮**
+    （不带游标的新检索），当前轮各页结果不受影响。
+
+    续页时 ``query`` / ``from_version`` / ``to_version`` / ``context``
+    必须与首轮一致（``to_version`` 缺省即沿用游标冻结上界），否则返回
+    422（``filter_mismatch``）；游标篡改、版本不支持、范围矛盾或跨文档
+    使用同样返回 422。``from_version`` / ``to_version`` 超出已有版本返回
+    404，``from_version > to_version`` 返回 422。接口不写入任何数据。
+    """
+    with db.read_transaction(con):
+        _get_document(con, document_id)
+        ceiling = search_mod.snapshot_watermark(con, document_id)
+        latest_number = search_mod.max_version_number(con, document_id)
+
+        last_key = None
+        parsed = None
+        if cursor is None:
+            # 首轮：冻结版本上界与批注 / 位置快照
+            effective_to = to_version if to_version is not None else latest_number
+            wm = ceiling
+        else:
+            try:
+                parsed = search_mod.decode_cursor(cursor, document_id, ceiling)
+            except search_mod.CursorError as exc:
+                raise _search_cursor_error(exc)
+            # 续页：快照与版本上界完全沿用游标；to_version 缺省视为沿用冻结值
+            effective_to = (
+                to_version if to_version is not None else parsed["filters"]["to"]
+            )
+            wm = parsed["wm"]
+            last_key = parsed["last"]
+
+        filters = search_mod.filters_dict(query, from_version, effective_to, context)
+        if parsed is not None and filters != parsed["filters"]:
+            raise HTTPException(
+                422,
+                detail={
+                    "error": "filter_mismatch",
+                    "message": "筛选条件与游标冻结值不一致：续页时 query / "
+                    "from_version / to_version / context 必须与首轮相同"
+                    "（to_version 缺省即沿用游标冻结的版本上界）",
+                    "cursor_filters": parsed["filters"],
+                    "request_filters": filters,
+                },
+            )
+
+        if from_version > latest_number:
+            raise HTTPException(
+                404, f"文档 {document_id} 不存在第 {from_version} 版"
+            )
+        if effective_to > latest_number:
+            raise HTTPException(
+                404, f"文档 {document_id} 不存在第 {effective_to} 版"
+            )
+        if from_version > effective_to:
+            raise HTTPException(
+                422,
+                f"版本范围矛盾：from_version={from_version} 大于 "
+                f"to_version={effective_to}",
+            )
+
+        version_texts = search_mod.load_version_texts(
+            con, document_id, from_version, effective_to
+        )
+        effective = search_mod.load_effective_annotations(
+            con, document_id, from_version, effective_to, wm
+        )
+        hits = search_mod.build_hits(version_texts, effective, query, context)
+
+    if last_key is not None:
+        # 续页：只返回排序键严格大于游标最后排序键的命中
+        hits = [h for h in hits if search_mod.sort_key(h) > last_key]
+    page = hits[:limit]
+    has_more = len(hits) > limit
+    next_cursor = (
+        search_mod.make_page_cursor(
+            document_id, filters, wm, search_mod.sort_key(page[-1])
+        )
+        if has_more
+        else None
+    )
+
+    return {
+        "document_id": document_id,
+        "query": query,
+        "from_version": from_version,
+        "to_version": effective_to,
+        "context": context,
+        "limit": limit,
+        "snapshot": wm,
+        "hit_count": len(page),
+        "has_more": has_more,
+        "hits": page,
+        "next_cursor": next_cursor,
     }

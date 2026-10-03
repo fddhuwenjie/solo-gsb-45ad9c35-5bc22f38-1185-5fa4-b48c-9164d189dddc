@@ -76,6 +76,16 @@
 `released` 结果。重复确认同一 `candidate_id` 原样返回首次结果（200，
 `already_released=true`），不重复写入。
 
+最后提供**版本范围内字面检索**（`GET /documents/{id}/search`）：审阅者
+指定同一文档的版本范围与一段文字，服务按 **Unicode 码点**做字面子串匹配
+并**保留重叠命中**；每个命中返回版本号、半开范围、**可复现的前后文片段**
+（带偏移，可按版本全文独立复算），以及与该范围**相交**的批注 ID 和生效
+状态（`resolved` / `confirmed` / `ambiguous` / `unresolved`，**确认范围
+优先于迁移候选**）。结果按 `(版本号, 起点, 终点)` 稳定排序，每页至多
+100 个命中；续页游标**冻结版本上界与批注 / 位置快照**——分页期间新增
+版本或批注**留到下一轮**；篡改、跨文档或筛选条件不一致的游标一律 422。
+接口只读，不写入任何数据。
+
 ## 快速开始
 
 一条命令在 8000 端口启动（二选一）：
@@ -98,7 +108,7 @@ docker build -t annotation-api . && docker run -p 8000:8000 annotation-api
 ```bash
 pip install -r requirements-dev.txt
 uvicorn app.main:app --reload --port 8000   # 数据库默认写入 ./data/app.db
-pytest                                       # 运行测试（279 个用例）
+pytest                                       # 运行测试（294 个用例）
 ```
 
 可用环境变量 `DB_PATH` 指定 SQLite 文件路径。
@@ -650,6 +660,62 @@ digest = hashlib.sha256(
 `package_digest_mismatch` 被 422 拒绝。无法识别的 `package_id` 返回
 404。
 
+### 版本范围内字面检索
+
+`GET /documents/{id}/search?query=&from_version=&to_version=&context=&limit=&cursor=`
+让审阅者在同一文档的**指定版本范围**内检索一段文字，并直接看到每个命中
+位置与相交批注的生效状态。接口只读，所有读取在**同一个 SQLite 读事务**
+（同一快照）中完成，不写入任何数据。
+
+**匹配与命中**：对 `[from_version, to_version]` 内每版全文按 **Unicode
+码点**做字面子串匹配（`to_version` 缺省取当前最新版；emoji 等 BMP 外
+字符算 1 个码点），**重叠命中全部保留**——`aaaa` 中检索 `aa` 得到
+`[0,2)`、`[1,3)`、`[2,4)` 三个命中。每个命中返回：
+
+| 字段 | 含义 |
+|---|---|
+| `version_number` / `start` / `end` | 版本号与半开范围 `[start, end)`（码点偏移） |
+| `context.before` / `context.after` | 命中两侧至多 `context` 个码点的原文（`context` 0～200，默认 20） |
+| `context.before_start` / `context.after_end` | 前后文偏移：**可复现**——`content[before_start:start] == before`、`content[end:after_end] == after` |
+| `annotations` | 与该范围**相交**（半开区间有公共码点；首尾相接不算）的批注，按批注 ID 升序 |
+
+`annotations` 每条给出 `annotation_id`、**生效状态**与实际相交的生效
+范围 `ranges`：
+
+| 该版生效情况 | `status` | 参与求交的范围 |
+|---|---|---|
+| 人工确认过 | `confirmed` | **确认范围**（确认范围优先于迁移候选，候选不再参与） |
+| 自动续接成功 | `resolved` | 迁移落点 |
+| 歧义未确认（非顺延） | `ambiguous` | 全部候选范围中实际相交者 |
+| `unresolved` / 歧义顺延占位 | — | 该版无生效范围，**不与任何命中相交** |
+
+**排序与分页**：结果按 `(version_number, start, end)` 全序稳定排序
+（同一版本内各命中起点互不相同），`limit` 1～100（默认 50），即每页
+**最多返回 100 个命中**；窗口未尽时响应给出 `next_cursor`。
+
+**快照冻结**：首轮在**同一个 SQLite 读事务**中冻结**版本上界**
+（`to_version` 缺省冻结为当前最新版）与**批注 / 位置快照**
+（annotations / locations / confirmations 三张只追加表上属于本文档的
+最大行 ID，响应 `snapshot` 透明给出）。续页游标（Base64URL 紧凑 JSON，
+自带版本号）封装文档 ID、筛选条件（检索文字、版本范围、上下文长度）、
+快照水位与最后排序键；分页期间**并发新增的版本 / 批注 / 迁移 / 确认
+留到下一轮**（不带游标的新检索），当前轮各页结果不受影响。续页时
+`query` / `from_version` / `to_version` / `context` 必须与首轮一致
+（`to_version` 缺省即沿用游标冻结上界，`limit` 可逐页调整）。
+
+游标出现下列情况一律返回 **422**（`detail.error` 为机器码）：
+
+| 情况 | `error` |
+|---|---|
+| Base64 / JSON 无法解码、字段缺失或多余、类型不对 | `bad_cursor_structure` |
+| 游标版本号不支持 | `bad_cursor_version` |
+| 负水位、水位超过当前数据库、`from > to`、最后排序键越出冻结版本范围 | `bad_cursor_range` |
+| 游标属于另一篇文档（不可跨文档使用） | `cross_document_cursor` |
+| 筛选条件与游标冻结值不一致 | `filter_mismatch` |
+
+`from_version` / `to_version` 超出已有版本返回 404，
+`from_version > to_version` 返回 422；文档不存在返回 404。
+
 ## API 一览
 
 | 方法 | 路径 | 说明 |
@@ -686,6 +752,7 @@ digest = hashlib.sha256(
 | GET | `/documents/{id}/events?limit=&cursor=` | 文档增量事件流：六类只追加记录按 (created_at, type_rank, id) 稳定合并，水位向量 + 续页/续拉游标分页（只读） |
 | POST | `/documents/{id}/review-packages` | 创建可离线往返的审阅包：同一读事务冻结最新迁移记录/候选/完成状态/全部传递前置，返回 package_id 与内容摘要 |
 | POST | `/review-packages/submit` | 回传审阅包：离线校验决定(422)→同写事务冲突检测(409,整包不写入)→按依赖顺序追加确认与完成；重复回传返回首次结果 |
+| GET | `/documents/{id}/search?query=&from_version=&to_version=&context=&limit=&cursor=` | 版本范围内字面检索：码点子串匹配保留重叠命中，命中含可复现前后文与相交批注生效状态（确认范围优先），稳定排序分页，游标冻结版本上界与批注/位置快照（只读） |
 
 ## 完整示例
 
@@ -1548,11 +1615,98 @@ curl -X POST $B/release-candidates/$CID/confirm
 # 则返回 path="gate" 的 gate_not_passed 冲突并附当前解释树。
 ```
 
+版本范围内字面检索示例（含**重叠命中、emoji 与并发写入**）：
+
+```bash
+B=http://localhost:8000
+
+# 1. 新建文档：基准文本含重叠模式 "aaaa" 与 emoji 🎯（BMP 外字符，算 1 个码点）
+#    码点偏移：a=0 a=1 a=2 a=3 🎯=4 b=5 b=6 🎯=7
+curl -X POST $B/documents -H 'Content-Type: application/json' -d '{
+  "title": "检索示例", "content": "aaaa🎯bb🎯"
+}'
+# 批注 1：选区 "🎯bb🎯" [4,8)，第 1 版上 resolved
+curl -X POST $B/documents/1/annotations -H 'Content-Type: application/json' -d '{
+  "body": "标记重点", "selection": "🎯bb🎯", "start": 4, "end": 8
+}'
+# 第 2 版 "aa🎯aa"：批注 1 的选区消失 → unresolved
+curl -X POST $B/documents/1/versions -H 'Content-Type: application/json' -d \
+  '{"content": "aa🎯aa"}'
+
+# 2. 【重叠命中】只在第 1 版检索 "aa"：重叠命中全部保留；
+#    批注范围 [4,8) 与命中 [2,4) 首尾相接 → 不算相交，annotations 为空
+curl "$B/documents/1/search?query=aa&to_version=1"
+# → {"document_id":1,"query":"aa","from_version":1,"to_version":1,"context":20,
+#    "limit":50,"snapshot":{"annotations":1,"locations":2,"confirmations":0},
+#    "hit_count":3,"has_more":false,"next_cursor":null,
+#    "hits":[
+#      {"version_number":1,"start":0,"end":2,
+#       "context":{"before":"","after":"aa🎯bb🎯","before_start":0,"after_end":8},
+#       "annotations":[]},
+#      {"version_number":1,"start":1,"end":3,..."annotations":[]},
+#      {"version_number":1,"start":2,"end":4,..."annotations":[]}]}
+
+# 3. 【emoji】检索 🎯（curl 用 --data-urlencode 自动做 URL 编码）：
+#    偏移按码点计；两个命中都与批注 1 的生效范围 [4,8) 相交
+curl -G "$B/documents/1/search" --data-urlencode "query=🎯" \
+  --data-urlencode "to_version=1"
+# → hits:[
+#   {"version_number":1,"start":4,"end":5,
+#    "context":{"before":"aaaa","after":"bb🎯","before_start":0,"after_end":8},
+#    "annotations":[{"annotation_id":1,"status":"resolved","ranges":[[4,8]]}]},
+#   {"version_number":1,"start":7,"end":8,
+#    "context":{"before":"aaaa🎯bb","after":"","before_start":0,"after_end":8},
+#    "annotations":[{"annotation_id":1,"status":"resolved","ranges":[[4,8]]}]}]
+# 前后文可复现：content[before_start:start] == before、content[end:after_end] == after
+
+# 4. 【分页 + 并发写入】全部版本检索 "aa"，limit=2：第 1 页返回后，
+#    另一会话并发提交第 3 版并在新版上新建批注——续页不受影响
+curl "$B/documents/1/search?query=aa&limit=2"
+# → 第 1 页：hits [(1,0,2),(1,1,3)]，has_more=true，to_version=2（冻结上界），
+#   snapshot={"annotations":1,"locations":2,"confirmations":0}，
+#   next_cursor="eyJ2IjoxLCJraW5kIjoicGFnZSIs..."
+
+# —— 并发写入（另一会话）：提交第 3 版 "aaaa🎯"（"aa" 又有 3 个重叠命中），
+#    并在第 3 版上创建批注 2（选区 "aa" [0,2)）——
+curl -X POST $B/documents/1/versions -H 'Content-Type: application/json' -d \
+  '{"content": "aaaa🎯"}'
+curl -X POST $B/documents/1/annotations -H 'Content-Type: application/json' -d \
+  '{"body": "新批注", "selection": "aa", "start": 0, "end": 2}'
+
+# 续页仍按首轮冻结的版本上界与批注/位置快照计算：
+# 不含第 3 版的命中，也看不到批注 2（并发新增留到下一轮）
+curl "$B/documents/1/search?query=aa&limit=2&cursor=eyJ2IjoxLCJraW5kIjoicGFnZSIs..."
+# → 第 2 页：hits [(1,2,4),(2,0,2)]，snapshot 与首轮相同，仍有 next_cursor
+curl "$B/documents/1/search?query=aa&limit=2&cursor=eyJ2IjoxLCJraW5kIjoicGFnZSIs..."
+# → 第 3 页（末页）：hits [(2,3,5)]，has_more=false，next_cursor=null
+
+# 5. 【下一轮】不带游标的新检索才能看到并发写入的结果：
+#    版本上界推进到 3，第 3 版命中带出批注 2（注意 [3,2,4) 与 [0,2) 相接不相交）
+curl "$B/documents/1/search?query=aa&limit=100"
+# → to_version=3，hit_count=8：
+#   (1,0,2)(1,1,3)(1,2,4) —— annotations 均空
+#   (2,0,2)(2,3,5)       —— annotations 均空（批注 1 在第 2 版 unresolved）
+#   (3,0,2)(3,1,3) —— annotations:[{"annotation_id":2,"status":"resolved","ranges":[[0,2]]}]
+#   (3,2,4)        —— annotations 空（与 [0,2) 首尾相接）
+
+# 6. 【游标校验】篡改 / 跨文档 / 筛选条件不一致 → 422
+curl "$B/documents/1/search?query=aa&cursor=garbage%21%21%21"
+# → 422 {"detail":{"error":"bad_cursor_structure","message":"游标无法解码：……"}}
+curl "$B/documents/2/search?query=aa&cursor=eyJ2Ijox...（文档 1 的游标）"
+# → 422 {"detail":{"error":"cross_document_cursor","message":"游标属于文档 1，……"}}
+curl "$B/documents/1/search?query=aa&context=5&cursor=eyJ2Ijox...（context=20 签发的游标）"
+# → 422 {"detail":{"error":"filter_mismatch",
+#        "message":"筛选条件与游标冻结值不一致：……",
+#        "cursor_filters":{"q":"aa","from":1,"to":2,"ctx":20},
+#        "request_filters":{"q":"aa","from":1,"to":2,"ctx":5}}}
+# 注：续页时 to_version 缺省即沿用游标冻结上界；limit 不是筛选条件，可逐页调整。
+```
+
 ## 项目结构
 
 ```
 app/
-  main.py       # FastAPI 路由与迁移流程（含改动影响分析、审阅依赖编排、归档导出/核验、发布门禁、脱敏、覆盖图、增量事件、批量偏移换算与离线审阅包接口）
+  main.py       # FastAPI 路由与迁移流程（含改动影响分析、审阅依赖编排、归档导出/核验、发布门禁、脱敏、覆盖图、增量事件、批量偏移换算、离线审阅包与字面检索接口）
   matching.py   # 锚点匹配核心（枚举落点、上下文打分、排序判定）
   diffing.py    # 两版全文的码点级编辑片段、范围投影与分类（纯函数）
   redacting.py  # 脱敏副本：生效范围合并为最大区间、按起点替换与源/结果码点区间映射（纯函数）
@@ -1564,6 +1718,7 @@ app/
   archive.py    # 迁移归档：同一读事务导出、规范化 JSON + SHA-256、离线一致性核验（不查库）
   review_packages.py # 离线审阅包：同读事务冻结快照/自动收录传递前置、离线决定整批校验、回传冲突检测与同写事务按依赖顺序应用、首次结果幂等重放
   release_candidates.py # 发布候选：同读事务固定版本/策略修订/门禁解释树/审阅状态/六类事件水位，初始门禁不过不落候选；确认时同写事务重读水位与门禁，冲突可定位且不改候选，水位未变且门禁通过才追加一次 released、重复确认幂等重放
+  search.py     # 版本范围内字面检索：码点子串匹配（保留重叠命中）、可复现前后文、相交批注生效状态（确认范围优先）、快照水位与续页游标编解码
   db.py         # SQLite 连接、建表、读写事务
   schemas.py    # 请求体模型（含门禁策略、归档结构、核验请求、批量偏移换算与审阅包模型）
 tests/
@@ -1580,6 +1735,7 @@ tests/
   test_archive.py   # 归档导出与离线核验测试（摘要篡改/缺行/串文档/顺延/确认非法）
   test_review_packages.py # 离线审阅包测试（同事务冻结/自动收录前置/离线整批校验/四类冲突不写入/依赖顺序应用/回滚/幂等重放/并发）
   test_release_candidates.py # 发布候选测试（同读事务冻结/初始门禁不过不落候选/六类水位与门禁复评冲突可定位/冲突不改候选/released 只写一次/幂等重放/跨文档隔离）
+  test_search.py    # 字面检索测试（重叠命中/emoji码点/可复现上下文/确认范围优先/顺延与unresolved不相交/稳定分页/快照冻结并发写入/游标422）
 Dockerfile
 docker-compose.yml
 requirements.txt        # 运行依赖
